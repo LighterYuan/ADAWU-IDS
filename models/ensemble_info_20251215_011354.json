@@ -1,0 +1,23 @@
+{
+  "ensemble_type": "dynamic",
+  "n_models": 3,
+  "weights": [
+    0.3333333333333333,
+    0.3333333333333333,
+    0.3333333333333333
+  ],
+  "model_info": {
+    "n_models": 3,
+    "weights": [
+      0.3333333333333333,
+      0.3333333333333333,
+      0.3333333333333333
+    ],
+    "weight_update_method": "dawu",
+    "average_performance": [
+      0.0,
+      0.0,
+      0.0
+    ]
+  }
+}
