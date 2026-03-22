@@ -1,0 +1,19 @@
+run_name: ablation
+dataset: CICIDS2017
+protocol: chronological_chunk_eval
+seed: 42
+
+variants:
+  - full
+  - no_msdi
+  - no_dynamic_weight
+  - no_hierarchical_response
+  - static_ensemble
+
+chunk_size: 5000
+sequence_length: 10
+
+paths:
+  trace_dir: results/traces
+  summary_dir: results/summaries
+  table_dir: results/tables
