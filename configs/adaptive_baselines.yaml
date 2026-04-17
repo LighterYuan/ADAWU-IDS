@@ -1,0 +1,24 @@
+run_name: adaptive_baselines
+dataset: CICIDS2017
+
+common:
+  random_state: 42
+  init_epochs: 5
+  update_epochs: 1
+  batch_size: 256
+  chunk_size: 5000
+
+dwm:
+  beta: 0.5
+  theta: 0.01
+  max_learners: 5
+
+online_bagging:
+  n_estimators: 5
+  lam: 1.0
+
+drift_triggered:
+  n_estimators: 3
+  drift_error_threshold: 0.25
+  performance_drop_threshold: 0.10
+  memory_chunks: 3

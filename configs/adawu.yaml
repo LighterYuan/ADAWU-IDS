@@ -1,0 +1,29 @@
+run_name: adawu_ids
+dataset: CICIDS2017
+
+common:
+  random_state: 42
+  init_epochs: 5
+  batch_size: 256
+  chunk_size: 5000
+  n_estimators: 5
+  reference_chunks: 5
+
+adawu:
+  alpha: 0.50
+  beta: 0.35
+  gamma: 0.15
+  lam: 0.05
+  min_weight: 0.02
+
+msdi:
+  eta: 0.60
+
+response:
+  mild_threshold: 0.20
+  moderate_threshold: 0.35
+  severe_threshold: 0.50
+  update_epochs_moderate: 2
+  update_epochs_severe: 4
+  severe_boost_factor: 1.8
+  moderate_boost_factor: 1.2
