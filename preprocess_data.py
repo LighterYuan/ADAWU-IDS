@@ -4,12 +4,13 @@
 
 import os
 import sys
+import numpy as np
 import pandas as pd
 from datetime import datetime
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from datasets.data_processor import CICIDSDataProcessor
+from data.data_processor import CICIDSDataProcessor
 from config import Config
 
 def inspect_dataset():

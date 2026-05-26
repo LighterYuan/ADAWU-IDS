@@ -1,0 +1,558 @@
+#!/usr/bin/env python3
+"""
+Validation-calibrated CICIDS2017 experiment for ADAWU-IDS.
+
+Purpose
+-------
+This script implements the "Plan A" revision route for the second-round review:
+1. Keep the fair chronological protocol from run_fair_cicids2017_experiment.py.
+2. Select ADAWU adaptive parameters using validation data only, not the test stream.
+3. Evaluate the selected ADAWU-Calibrated configuration on the held-out test stream.
+4. Run static and adaptive baselines under the same protocol.
+5. Optionally run component ablations around the selected configuration.
+6. Export mean/std/95% CI and paired seed-level statistical comparisons.
+
+Expected placement
+------------------
+Place this file in the same directory as run_fair_cicids2017_experiment.py, e.g.:
+  project_root/pipelines/run_calibrated_cicids2017_experiment.py
+  project_root/pipelines/run_fair_cicids2017_experiment.py
+
+Example
+-------
+python pipelines/run_calibrated_cicids2017_experiment.py \
+  --data-dir datasets/processed \
+  --output-dir results/calibrated_cicids2017 \
+  --seeds 42 52 62 72 82 \
+  --calibration-seeds 42 52 62 \
+  --chunk-size 5000 \
+  --include-ablation
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import csv
+import importlib.util
+import json
+import math
+import sys
+from dataclasses import asdict, replace
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import numpy as np
+
+try:
+    from scipy.stats import ttest_rel, wilcoxon
+except Exception:  # pragma: no cover
+    ttest_rel = None
+    wilcoxon = None
+
+
+THIS_DIR = Path(__file__).resolve().parent
+DEFAULT_FAIR_PATH = THIS_DIR / "run_fair_cicids2017_experiment.py"
+
+
+def load_fair_module(path: Path):
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Cannot find {path}. Put run_calibrated_cicids2017_experiment.py "
+            "in the same folder as run_fair_cicids2017_experiment.py, or pass --fair-script."
+        )
+    spec = importlib.util.spec_from_file_location("fair_cicids_module", str(path))
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Cannot import fair script from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["fair_cicids_module"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def safe_json_dump(obj: object, path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+
+
+def write_csv(rows: List[Dict[str, object]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        return
+    keys = sorted({k for row in rows for k in row.keys()})
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=keys)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def retrain_rate(records: Sequence[Dict[str, object]]) -> float:
+    if not records:
+        return 0.0
+    return float(sum(1 for r in records if bool(r.get("retrain_event", False))) / len(records))
+
+
+def ids_selection_score(overall: Dict[str, float], records: Sequence[Dict[str, object]], metric: str) -> float:
+    """Validation-only selection score.
+
+    weighted_f1: maximize global weighted F1.
+    attack_f1: maximize attack-class F1.
+    ids_score: IDS-oriented composite. It rewards weighted F1, attack F1 and
+               attack recall, with a small penalty for frequent retraining.
+    """
+    if metric == "weighted_f1":
+        return float(overall.get("weighted_f1", 0.0))
+    if metric == "attack_f1":
+        return float(overall.get("attack_f1", 0.0))
+    if metric == "attack_recall":
+        return float(overall.get("attack_recall", 0.0))
+    if metric != "ids_score":
+        raise ValueError(f"Unsupported selection metric: {metric}")
+    return float(
+        0.40 * overall.get("weighted_f1", 0.0)
+        + 0.35 * overall.get("attack_f1", 0.0)
+        + 0.25 * overall.get("attack_recall", 0.0)
+        - 0.01 * retrain_rate(records)
+    )
+
+
+def candidate_grid(fair, base_cfg, mode: str):
+    """Return candidate ADAWU configurations and response policies.
+
+    All candidates keep MSDI enabled. Calibration chooses weighting/response
+    parameters and response aggressiveness on validation data only.
+    """
+    if mode not in {"small", "medium"}:
+        raise ValueError("mode must be 'small' or 'medium'")
+
+    cands = []
+
+    def add(name: str, cfg, use_hierarchy: bool = True):
+        cands.append({"name": name, "cfg": cfg, "use_msdi": True, "use_weighting": True, "use_hierarchy": use_hierarchy})
+
+    # Original manuscript configuration.
+    add("default_full", base_cfg)
+
+    # Validation-gated policy: keep drift-aware weighting, suppress costly retraining.
+    add("weight_only_default", base_cfg, use_hierarchy=False)
+
+    # Conservative severity response: only severe drift triggers retraining.
+    add(
+        "severe_only_035_055_075",
+        replace(
+            base_cfg,
+            mild_threshold=0.35,
+            moderate_threshold=0.55,
+            severe_threshold=0.75,
+            update_on_mild=False,
+            update_on_moderate=False,
+            update_on_severe=True,
+        ),
+        use_hierarchy=True,
+    )
+
+    # Performance-dominant weighting, no retraining unless validation supports it.
+    add("perf_dominant_weight_only", replace(base_cfg, alpha=0.70, beta=0.20, gamma=0.10), use_hierarchy=False)
+
+    if mode == "medium":
+        add(
+            "lower_threshold_full_025_045_065",
+            replace(base_cfg, mild_threshold=0.25, moderate_threshold=0.45, severe_threshold=0.65),
+            use_hierarchy=True,
+        )
+        add(
+            "high_threshold_full_040_060_080",
+            replace(base_cfg, mild_threshold=0.40, moderate_threshold=0.60, severe_threshold=0.80),
+            use_hierarchy=True,
+        )
+        add("balanced_weight_only", replace(base_cfg, alpha=0.50, beta=0.35, gamma=0.15), use_hierarchy=False)
+        add("drift_heavier_weight_only", replace(base_cfg, alpha=0.45, beta=0.40, gamma=0.15), use_hierarchy=False)
+        add(
+            "moderate_severe_030_050_070",
+            replace(base_cfg, update_on_mild=False, update_on_moderate=True, update_on_severe=True),
+            use_hierarchy=True,
+        )
+
+    return cands
+
+
+def aggregate_candidate_rows(rows: List[Dict[str, object]], metric: str) -> List[Dict[str, object]]:
+    grouped: Dict[str, List[Dict[str, object]]] = {}
+    for row in rows:
+        grouped.setdefault(str(row["candidate"]), []).append(row)
+    out = []
+    for name, items in grouped.items():
+        scores = np.asarray([float(x["selection_score"]) for x in items], dtype=float)
+        wf1 = np.asarray([float(x.get("weighted_f1", np.nan)) for x in items], dtype=float)
+        attack_f1 = np.asarray([float(x.get("attack_f1", np.nan)) for x in items], dtype=float)
+        attack_recall = np.asarray([float(x.get("attack_recall", np.nan)) for x in items], dtype=float)
+        rrate = np.asarray([float(x.get("retrain_rate", np.nan)) for x in items], dtype=float)
+        out.append(
+            {
+                "candidate": name,
+                "n_seeds": len(items),
+                "selection_metric": metric,
+                "selection_score_mean": float(np.nanmean(scores)),
+                "selection_score_std": float(np.nanstd(scores, ddof=1)) if len(scores) > 1 else 0.0,
+                "weighted_f1_mean": float(np.nanmean(wf1)),
+                "attack_f1_mean": float(np.nanmean(attack_f1)),
+                "attack_recall_mean": float(np.nanmean(attack_recall)),
+                "retrain_rate_mean": float(np.nanmean(rrate)),
+            }
+        )
+    out.sort(key=lambda x: (-float(x["selection_score_mean"]), str(x["candidate"])))
+    return out
+
+
+def ci95(values: Sequence[float]) -> float:
+    arr = np.asarray(values, dtype=float)
+    if len(arr) <= 1:
+        return 0.0
+    return float(1.96 * np.std(arr, ddof=1) / math.sqrt(len(arr)))
+
+
+def pairwise_tests(results: List[Dict[str, object]], reference: str, metrics: Sequence[str]) -> List[Dict[str, object]]:
+    by_method: Dict[str, Dict[int, Dict[str, float]]] = {}
+    for res in results:
+        method = str(res["method"])
+        seed = int(res["seed"])
+        by_method.setdefault(method, {})[seed] = dict(res.get("overall", {}))
+
+    if reference not in by_method:
+        return []
+
+    rows = []
+    ref_seeds = set(by_method[reference].keys())
+    for method, seed_map in sorted(by_method.items()):
+        if method == reference:
+            continue
+        seeds = sorted(ref_seeds & set(seed_map.keys()))
+        for metric in metrics:
+            ref_vals = np.asarray([by_method[reference][s].get(metric, np.nan) for s in seeds], dtype=float)
+            cmp_vals = np.asarray([seed_map[s].get(metric, np.nan) for s in seeds], dtype=float)
+            mask = np.isfinite(ref_vals) & np.isfinite(cmp_vals)
+            ref_vals = ref_vals[mask]
+            cmp_vals = cmp_vals[mask]
+            if len(ref_vals) == 0:
+                continue
+            diff = ref_vals - cmp_vals
+            row = {
+                "reference": reference,
+                "comparison": method,
+                "metric": metric,
+                "n_paired_seeds": int(len(diff)),
+                "reference_mean": float(np.mean(ref_vals)),
+                "comparison_mean": float(np.mean(cmp_vals)),
+                "mean_difference_ref_minus_comparison": float(np.mean(diff)),
+                "difference_ci95": ci95(diff),
+            }
+            if len(diff) >= 2 and ttest_rel is not None:
+                try:
+                    row["paired_ttest_p"] = float(ttest_rel(ref_vals, cmp_vals, nan_policy="omit").pvalue)
+                except Exception:
+                    row["paired_ttest_p"] = None
+            if len(diff) >= 2 and wilcoxon is not None and not np.allclose(diff, 0.0):
+                try:
+                    row["wilcoxon_p"] = float(wilcoxon(ref_vals, cmp_vals).pvalue)
+                except Exception:
+                    row["wilcoxon_p"] = None
+            rows.append(row)
+    return rows
+
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Validation-calibrated ADAWU-IDS CICIDS2017 experiment")
+    p.add_argument("--fair-script", type=Path, default=DEFAULT_FAIR_PATH)
+    p.add_argument("--data-dir", type=Path, default=None)
+    p.add_argument("--output-dir", type=Path, default=None)
+    p.add_argument("--seeds", type=int, nargs="+", default=[42, 52, 62, 72, 82])
+    p.add_argument("--calibration-seeds", type=int, nargs="+", default=[42, 52, 62])
+    p.add_argument("--chunk-size", type=int, default=5000)
+    p.add_argument("--train-segments", type=str, default=None)
+    p.add_argument("--val-segments", type=str, default=None)
+    p.add_argument("--test-segments", type=str, default=None)
+    p.add_argument("--epochs", type=int, default=5)
+    p.add_argument("--batch-size", type=int, default=256)
+    p.add_argument("--learning-rate", type=float, default=1e-3)
+    p.add_argument("--adaptation-rate", type=float, default=1e-4)
+    p.add_argument("--candidate-grid", choices=["small", "medium"], default="medium")
+    p.add_argument("--selection-metric", choices=["ids_score", "weighted_f1", "attack_f1", "attack_recall"], default="ids_score")
+    p.add_argument("--include-ablation", action="store_true")
+    p.add_argument("--skip-baselines", action="store_true", help="Only run ADAWU-Calibrated and optional ADAWU ablations")
+    p.add_argument("--reference-max-samples", type=int, default=50000)
+    return p.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    fair = load_fair_module(args.fair_script)
+
+    data_dir = args.data_dir or (Path(args.fair_script).resolve().parents[1] / "datasets" / "processed")
+    output_dir = args.output_dir or (Path(args.fair_script).resolve().parents[1] / "results" / "calibrated_cicids2017")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    train_segments = fair.parse_segments(args.train_segments, fair.DEFAULT_TRAIN_SEGMENTS)
+    val_segments = fair.parse_segments(args.val_segments, fair.DEFAULT_VAL_SEGMENTS)
+    test_segments = fair.parse_segments(args.test_segments, fair.DEFAULT_TEST_SEGMENTS)
+    fair.assert_no_overlap(train_segments, val_segments, test_segments)
+    if not val_segments:
+        raise ValueError("Validation segments are required for calibration. Do not pass an empty --val-segments.")
+
+    base_cfg = fair.ADAWUConfig(
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.learning_rate,
+        adaptation_rate=args.adaptation_rate,
+        reference_max_samples=args.reference_max_samples,
+    )
+    baseline_cfg = fair.BaselineConfig()
+    candidates = candidate_grid(fair, base_cfg, args.candidate_grid)
+
+    manifest = {
+        "script": Path(__file__).name,
+        "fair_script": str(args.fair_script),
+        "dataset": "CICIDS2017",
+        "protocol": "validation_calibrated_chronological_streaming",
+        "fairness_rules": [
+            "preprocessor fitted only on train segments",
+            "validation stream used only for hyperparameter/policy selection",
+            "test stream held out until final evaluation",
+            "no train/test overlap and no validation/test overlap",
+            "all methods share identical chronological test chunks",
+            "prediction is recorded before current chunk labels are used for online update",
+        ],
+        "train_segments": list(train_segments),
+        "validation_segments": list(val_segments),
+        "test_segments": list(test_segments),
+        "chunk_size": args.chunk_size,
+        "seeds": list(args.seeds),
+        "calibration_seeds": list(args.calibration_seeds),
+        "selection_metric": args.selection_metric,
+        "candidate_grid": args.candidate_grid,
+        "base_adawu_config": asdict(base_cfg),
+        "baseline_config": asdict(baseline_cfg),
+        "candidates": [
+            {
+                "name": c["name"],
+                "use_msdi": c["use_msdi"],
+                "use_weighting": c["use_weighting"],
+                "use_hierarchy": c["use_hierarchy"],
+                "config": asdict(c["cfg"]),
+            }
+            for c in candidates
+        ],
+    }
+    safe_json_dump(manifest, output_dir / "protocol_manifest.json")
+
+    # --------------------------
+    # 1) Validation calibration
+    # --------------------------
+    calibration_rows: List[Dict[str, object]] = []
+    for cand in candidates:
+        print(f"[CALIBRATE] candidate={cand['name']}", flush=True)
+        for seed in args.calibration_seeds:
+            fair.set_global_seed(seed)
+            X_train_2d, X_train_3d, y_train, shape_info, imputer, scaler = fair.build_preprocessor(Path(data_dir), train_segments)
+            # Do not use the validation segment for early stopping during calibration.
+            classes = np.asarray(sorted(np.unique(y_train).tolist()))
+            result = fair.run_adawu_variant(
+                seed=seed,
+                cfg=copy.deepcopy(cand["cfg"]),
+                variant_name=f"calib_{cand['name']}",
+                data_dir=Path(data_dir),
+                test_segments=val_segments,
+                chunk_size=args.chunk_size,
+                imputer=imputer,
+                scaler=scaler,
+                shape_info=shape_info,
+                X_train_3d=X_train_3d,
+                y_train=y_train,
+                X_val_3d=None,
+                y_val=None,
+                classes=classes,
+                use_msdi=bool(cand["use_msdi"]),
+                use_weighting=bool(cand["use_weighting"]),
+                use_hierarchy=bool(cand["use_hierarchy"]),
+            )
+            overall = dict(result["overall"])
+            score = ids_selection_score(overall, result["records"], args.selection_metric)
+            row = {
+                "candidate": cand["name"],
+                "seed": seed,
+                "selection_metric": args.selection_metric,
+                "selection_score": score,
+                "retrain_rate": retrain_rate(result["records"]),
+                **overall,
+            }
+            calibration_rows.append(row)
+            print(f"  seed={seed} score={score:.6f} overall={overall}", flush=True)
+
+    calib_summary = aggregate_candidate_rows(calibration_rows, args.selection_metric)
+    write_csv(calibration_rows, output_dir / "calibration" / "candidate_validation_by_seed.csv")
+    write_csv(calib_summary, output_dir / "calibration" / "candidate_validation_summary.csv")
+    safe_json_dump(calibration_rows, output_dir / "calibration" / "candidate_validation_by_seed.json")
+    safe_json_dump(calib_summary, output_dir / "calibration" / "candidate_validation_summary.json")
+
+    selected_name = str(calib_summary[0]["candidate"])
+    selected = next(c for c in candidates if c["name"] == selected_name)
+    safe_json_dump(
+        {
+            "selected_candidate": selected_name,
+            "selection_metric": args.selection_metric,
+            "selected_summary": calib_summary[0],
+            "selected_config": asdict(selected["cfg"]),
+            "use_msdi": selected["use_msdi"],
+            "use_weighting": selected["use_weighting"],
+            "use_hierarchy": selected["use_hierarchy"],
+        },
+        output_dir / "calibration" / "selected_candidate.json",
+    )
+    print(f"[SELECTED] {selected_name} by {args.selection_metric}", flush=True)
+
+    # --------------------------
+    # 2) Held-out test evaluation
+    # --------------------------
+    final_results: List[Dict[str, object]] = []
+    methods_for_sgd = [] if args.skip_baselines else ["dwm", "online_bagging", "leveraging_bagging"]
+
+    for seed in args.seeds:
+        print(f"[TEST] seed={seed}", flush=True)
+        fair.set_global_seed(seed)
+        X_train_2d, X_train_3d, y_train, shape_info, imputer, scaler = fair.build_preprocessor(Path(data_dir), train_segments)
+        X_val_3d, y_val = fair.prepare_validation(Path(data_dir), val_segments, imputer, scaler, shape_info)
+        classes = np.asarray(sorted(np.unique(y_train).tolist()))
+
+        if not args.skip_baselines:
+            static_res = fair.run_static_lstm(
+                seed=seed,
+                cfg=copy.deepcopy(base_cfg),
+                data_dir=Path(data_dir),
+                test_segments=test_segments,
+                chunk_size=args.chunk_size,
+                imputer=imputer,
+                scaler=scaler,
+                shape_info=shape_info,
+                X_train_3d=X_train_3d,
+                y_train=y_train,
+                X_val_3d=X_val_3d,
+                y_val=y_val,
+            )
+            final_results.append(static_res)
+            fair.save_result(static_res, output_dir)
+
+            sgd_results = fair.run_sgd_streaming_methods(
+                seed=seed,
+                baseline_cfg=copy.deepcopy(baseline_cfg),
+                data_dir=Path(data_dir),
+                test_segments=test_segments,
+                chunk_size=args.chunk_size,
+                imputer=imputer,
+                scaler=scaler,
+                shape_info=shape_info,
+                X_train_2d=X_train_2d,
+                y_train=y_train,
+                classes=classes,
+                methods=methods_for_sgd,
+            )
+            for res in sgd_results.values():
+                final_results.append(res)
+                fair.save_result(res, output_dir)
+
+        cal_res = fair.run_adawu_variant(
+            seed=seed,
+            cfg=copy.deepcopy(selected["cfg"]),
+            variant_name="adawu_calibrated",
+            data_dir=Path(data_dir),
+            test_segments=test_segments,
+            chunk_size=args.chunk_size,
+            imputer=imputer,
+            scaler=scaler,
+            shape_info=shape_info,
+            X_train_3d=X_train_3d,
+            y_train=y_train,
+            X_val_3d=X_val_3d,
+            y_val=y_val,
+            classes=classes,
+            use_msdi=bool(selected["use_msdi"]),
+            use_weighting=bool(selected["use_weighting"]),
+            use_hierarchy=bool(selected["use_hierarchy"]),
+        )
+        final_results.append(cal_res)
+        fair.save_result(cal_res, output_dir)
+        print(f"  [OK] adawu_calibrated seed={seed} overall={cal_res['overall']}", flush=True)
+
+        # Report the original default full response as a diagnostic, not as calibrated model.
+        forced_default = fair.run_adawu_variant(
+            seed=seed,
+            cfg=copy.deepcopy(base_cfg),
+            variant_name="adawu_default_full",
+            data_dir=Path(data_dir),
+            test_segments=test_segments,
+            chunk_size=args.chunk_size,
+            imputer=imputer,
+            scaler=scaler,
+            shape_info=shape_info,
+            X_train_3d=X_train_3d,
+            y_train=y_train,
+            X_val_3d=X_val_3d,
+            y_val=y_val,
+            classes=classes,
+            use_msdi=True,
+            use_weighting=True,
+            use_hierarchy=True,
+        )
+        final_results.append(forced_default)
+        fair.save_result(forced_default, output_dir)
+
+        if args.include_ablation:
+            ablations = [
+                ("adawu_calibrated_no_msdi", False, True, bool(selected["use_hierarchy"])),
+                ("adawu_calibrated_no_weighting", True, False, bool(selected["use_hierarchy"])),
+                ("adawu_calibrated_no_hierarchy", True, True, False),
+            ]
+            for name, use_msdi, use_weighting, use_hierarchy in ablations:
+                # Avoid exact duplicate if selected policy already disables hierarchy.
+                if name == "adawu_calibrated_no_hierarchy" and not bool(selected["use_hierarchy"]):
+                    continue
+                res = fair.run_adawu_variant(
+                    seed=seed,
+                    cfg=copy.deepcopy(selected["cfg"]),
+                    variant_name=name,
+                    data_dir=Path(data_dir),
+                    test_segments=test_segments,
+                    chunk_size=args.chunk_size,
+                    imputer=imputer,
+                    scaler=scaler,
+                    shape_info=shape_info,
+                    X_train_3d=X_train_3d,
+                    y_train=y_train,
+                    X_val_3d=X_val_3d,
+                    y_val=y_val,
+                    classes=classes,
+                    use_msdi=use_msdi,
+                    use_weighting=use_weighting,
+                    use_hierarchy=use_hierarchy,
+                )
+                final_results.append(res)
+                fair.save_result(res, output_dir)
+
+    aggregate_rows = fair.aggregate_seed_results(final_results)
+    write_csv(aggregate_rows, output_dir / "tables" / "overall_mean_std_ci95.csv")
+    safe_json_dump(aggregate_rows, output_dir / "summaries" / "overall_mean_std_ci95.json")
+
+    stats_rows = pairwise_tests(
+        final_results,
+        reference="adawu_calibrated",
+        metrics=["weighted_f1", "macro_f1", "attack_recall", "attack_f1", "false_negative_rate"],
+    )
+    write_csv(stats_rows, output_dir / "tables" / "paired_statistical_tests.csv")
+    safe_json_dump(stats_rows, output_dir / "summaries" / "paired_statistical_tests.json")
+
+    print("[DONE] Validation-calibrated CICIDS2017 experiment completed")
+    print(f"[OUT] {output_dir}")
+
+
+if __name__ == "__main__":
+    main()
